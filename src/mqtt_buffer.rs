@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::{NaiveDateTime, TimeZone, Local, Utc};
-use duckdb::arrow::array::{TimestampMicrosecondArray, Float64Array, Int64Array, StringArray};
+use duckdb::arrow::array::{TimestampMicrosecondArray, Float64Array, UInt32Array, StringArray};
 use duckdb::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use duckdb::arrow::record_batch::RecordBatch;
 use std::sync::Arc;
@@ -72,8 +72,7 @@ pub fn normalize_one_message(json_str: &str) -> Vec<NormalizedRow> {
                         measurement_type: MeasurementType::from_key(key),
                         value: num as f32,
                         raw_json: Some(raw.measurements.to_string()),
-                    });
-                    println!("Pushed normalized row {:?}", rows[rows.len()-1]);
+                    });                    
                 }
             }
         }
@@ -127,7 +126,7 @@ fn create_arrow_record_batch(rows: &[NormalizedRow]) -> Result<RecordBatch> {
     let ra = TimestampMicrosecondArray::from(rows.iter().map(|r| r.timestamp).collect::<Vec<i64>>());
     let model_arr = StringArray::from(rows.iter().map(|r| r.model.clone()).collect::<Vec<String>>());
     let id_arr = StringArray::from(rows.iter().map(|r| r.sensor_id.clone()).collect::<Vec<String>>());
-    let q_arr = Int64Array::from(rows.iter().map(|r| r.measurement_type as i64).collect::<Vec<i64>>());
+    let q_arr = UInt32Array::from(rows.iter().map(|r| r.measurement_type as u32).collect::<Vec<u32>>());
     let meas_arr = Float64Array::from(rows.iter().map(|r| r.value as f64).collect::<Vec<f64>>());
     let raw_arr = StringArray::from(
         rows.iter()
@@ -139,7 +138,7 @@ fn create_arrow_record_batch(rows: &[NormalizedRow]) -> Result<RecordBatch> {
         Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
         Field::new("model", DataType::Utf8, false),
         Field::new("sensor_id", DataType::Utf8, false),
-        Field::new("measurement_type", DataType::Int64, false),
+        Field::new("measurement_type", DataType::UInt32, false),
         Field::new("value", DataType::Float64, false),
         Field::new("raw_json", DataType::Utf8, false),
     ]));

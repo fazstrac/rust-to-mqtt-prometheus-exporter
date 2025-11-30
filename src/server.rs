@@ -17,12 +17,15 @@ pub async fn run() -> anyhow::Result<()> {
     let store: Store = Arc::new(tokio::sync::RwLock::new(initial));
 
     let registry = Arc::new(Registry::new());
-    let messages_counter = IntCounter::new("mqtt_messages_total", "Total MQTT messages received").unwrap();
-    registry.register(Box::new(messages_counter.clone())).ok();
+    let mqtt_messages_received_counter = IntCounter::new("mqtt_messages_total", "Total MQTT messages received").unwrap();
+    let mqtt_messages_not_flushed_to_db = IntCounter::new("mqtt_unflushed_total", "Total unflushed MQTT messages in WAL").unwrap();
+    registry.register(Box::new(mqtt_messages_received_counter.clone())).ok();
+    registry.register(Box::new(mqtt_messages_not_flushed_to_db.clone())).ok();
 
-    let mqtt_counter = messages_counter.clone();
+    let mqtt_messages_received_counter_task = mqtt_messages_received_counter.clone();
+    let mqtt_messages_not_flushed_to_db_task = mqtt_messages_not_flushed_to_db.clone();
     task::spawn(async move {
-        if let Err(e) = mqtt::start_mqtt_loop(mqtt_counter).await {
+        if let Err(e) = mqtt::start_mqtt_loop(mqtt_messages_received_counter_task, mqtt_messages_not_flushed_to_db_task).await {
             eprintln!("MQTT task ended: {}", e);
         }
     });
