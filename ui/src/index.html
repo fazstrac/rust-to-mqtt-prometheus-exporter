@@ -1,0 +1,60 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Mappings UI</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; }
+    label { display:block; margin-top:1rem }
+    input { width: 100%; max-width: 400px }
+    button { margin-top: 1rem }
+    table { border-collapse: collapse; margin-top: 1rem }
+    td, th { border: 1px solid #ddd; padding: 6px 10px }
+  </style>
+</head>
+<body>
+  <h1>Sensor Mappings</h1>
+  <form id="mappingForm">
+    <label>Sensor ID <input id="sensor_id" required /></label>
+    <label>Manufacturer <input id="manufacturer" required /></label>
+    <label>Logical name <input id="name" required /></label>
+    <button type="submit">Save mapping</button>
+  </form>
+
+  <h2>Existing mappings</h2>
+  <table id="mappingsTable"><thead><tr><th>Manufacturer</th><th>Sensor ID</th><th>Name</th></tr></thead><tbody></tbody></table>
+
+  <script type="module">
+  async function listMappings(){
+    const res = await fetch('/mapping');
+    if(!res.ok){ console.error('failed to load mappings'); return }
+    const data = await res.json();
+    const tbody = document.querySelector('#mappingsTable tbody');
+    tbody.innerHTML = '';
+    data.forEach(m=>{
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${m.manufacturer}</td><td>${m.sensor_id}</td><td>${m.name}</td>`;
+      tbody.appendChild(tr);
+    });
+  }
+
+  document.getElementById('mappingForm').addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const sensor_id = document.getElementById('sensor_id').value;
+    const manufacturer = document.getElementById('manufacturer').value;
+    const name = document.getElementById('name').value;
+    const payload = { sensor_id, manufacturer, name };
+    const res = await fetch('/mapping', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    if(res.status===201){
+      await listMappings();
+      (document.getElementById('mappingForm')).reset();
+    } else {
+      alert('Failed to save mapping');
+    }
+  });
+
+  listMappings();
+  </script>
+</body>
+</html>

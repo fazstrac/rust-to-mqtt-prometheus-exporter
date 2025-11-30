@@ -1,0 +1,28 @@
+[package]
+name = "rust-to-mqtt-prometheus-exporter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8.7"
+duckdb = { version="1.4.2", features=["appender-arrow", "vtab-arrow"]}
+prometheus = "0.14.0"
+rumqttc = "0.25.1"
+tokio = { version = "1.48.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+hyper = { version = "0.14", features = ["server"] }
+tower-http = { version = "0.3", features = ["cors"] }
+http = "0.2"
+chrono = { version = "0.4", features = ["serde"] }
+arrow = "57.1.0"
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

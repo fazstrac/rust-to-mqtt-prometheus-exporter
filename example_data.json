@@ -1,0 +1,40 @@
+[
+  {
+    "time": "2025-11-29 22:00:39",
+    "model": "LaCrosse-TX29IT",
+    "id": 19,
+    "battery_ok": 1,
+    "newbattery": 0,
+    "temperature_C": 20.9,
+    "mic": "CRC"
+  },
+  {
+    "time": "2025-11-29 22:00:59",
+    "model": "LaCrosse-TX141Bv3",
+    "id": 246,
+    "channel": 1,
+    "battery_ok": 1,
+    "temperature_C": 22.0,
+    "test": "No"
+  },
+  {
+    "time": "2025-11-29 22:02:28",
+    "model": "Toyota",
+    "type": "TPMS",
+    "id": "f1c7e267",
+    "status": 128,
+    "pressure_kPa": 246.48758,
+    "temperature_C": 6.0,
+    "mic": "CRC"
+  },
+  {
+    "time": "2025-11-29 22:02:33",
+    "model": "Ambientweather-F007TH",
+    "id": 141,
+    "channel": 1,
+    "battery_ok": 0,
+    "temperature_C": 18.72223,
+    "humidity": 40,
+    "mic": "CRC"
+  }
+]
