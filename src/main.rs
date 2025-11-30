@@ -6,6 +6,7 @@ mod state;
 mod handlers;
 mod mqtt;
 mod server;
+mod mqtt_buffer;
 
 /// Start the service. Keep `main` minimal so hot-reloads, tests, and
 /// integration points can import `server::run()` directly if needed.

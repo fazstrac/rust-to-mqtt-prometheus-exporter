@@ -6,6 +6,8 @@
 use prometheus::IntCounter;
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
 
+use crate::mqtt_buffer;
+
 /// Start a long-running MQTT loop. This function never returns unless an
 /// unrecoverable error occurs. It is intended to be spawned with
 /// `tokio::task::spawn` from `server::run()` so it runs in the background.
@@ -84,21 +86,42 @@ pub async fn start_mqtt_loop(counter: IntCounter) -> anyhow::Result<()> {
         }
     }
 
+    let mut all_rows: Vec<mqtt_buffer::NormalizedRow> = Vec::new();
+    let conn = duckdb::Connection::open("measurements.db").unwrap();
+
+    mqtt_buffer::create_table(&conn, "measurements").unwrap();
+
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Incoming::Publish(p))) => {
                 counter.inc();
                 println!("Topic: {}, Payload: {:?}", p.topic, p.payload);
-                // TODO: Persist message to DuckDB/DuckLake here and compute Prometheus metrics
+
+                let payload_str = String::from_utf8_lossy(&p.payload);
+                let rows = mqtt_buffer::normalize_one_message(&payload_str);
+                all_rows.extend(rows);
+
+                if counter.get() == 10 {
+                    // Every 1000 messages, flush to DuckDB
+                    match mqtt_buffer::flush_to_duckdb(all_rows.clone(), &conn, "measurements") {
+                        Ok(_) => {
+                            println!("Flushed {} rows to DuckDB", all_rows.len());
+                            all_rows.clear();
+                        }
+                        Err(e) => {
+                            eprintln!("Error flushing to DuckDB: {}", e);
+                        }
+                    }
+
+                    counter.reset();
+                }
             }
             Ok(Event::Incoming(i)) => {
                 // Other incoming events (e.g., ConnAck, SubAck)
                 // Mostly ignore but log for visibility
-                counter.inc();
                 println!("Incoming = {i:?}");
             }
             Ok(Event::Outgoing(o)) => {
-                counter.inc();
                 println!("Outgoing = {o:?}");
             }
             Err(e) => {
