@@ -10,7 +10,11 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::http::{Request, Method, HeaderValue, StatusCode};
 
-
+// TODO
+// - Graceful shutdown handling (SIGINT/SIGTERM)
+// - IDEA: reread config/mappings on SIGHUP?
+// - Centralized database handler shared between MQTT task and HTTP handlers
+// - Persist mappings to database
 
 pub async fn run() -> anyhow::Result<()> {
     let initial = load_mappings().await.unwrap_or_default();
