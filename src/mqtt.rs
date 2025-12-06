@@ -6,13 +6,22 @@
 use prometheus::IntCounter;
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
 use tokio::time::{self, Duration};
+use std::sync::Arc;
+use tokio::sync::Notify;
 
 use crate::mqtt_buffer;
 
 /// Start a long-running MQTT loop. This function never returns unless an
 /// unrecoverable error occurs. It is intended to be spawned with
 /// `tokio::task::spawn` from `server::run()` so it runs in the background.
-pub async fn start_mqtt_loop(counter_tot_msg: IntCounter, counter_unflushed_msg: IntCounter) -> anyhow::Result<()> {
+use crate::db::DbHandle;
+
+pub async fn start_mqtt_loop(
+    counter_tot_msg: IntCounter, 
+    counter_unflushed_msg: IntCounter,
+    db: DbHandle,
+    shutdown: Arc<Notify>,
+) -> anyhow::Result<()> {
     // Create MQTT options from environment variables. Check for host,
     // port, username, and password; use defaults if not provided.
     // Not all fields are required; we default to localhost:1883
@@ -88,9 +97,19 @@ pub async fn start_mqtt_loop(counter_tot_msg: IntCounter, counter_unflushed_msg:
     }
 
     let mut all_rows: Vec<mqtt_buffer::NormalizedRow> = Vec::new();
-    let conn = duckdb::Connection::open("measurements.db").unwrap();
 
-    mqtt_buffer::create_table(&conn, "measurements").unwrap();
+    // Ensure table exists via DB worker
+    let create_table_sql = format!(
+        "CREATE TABLE IF NOT EXISTS measurements (
+            timestamp TIMESTAMP,
+            model VARCHAR,
+            sensor_id VARCHAR,
+            measurement_type INTEGER,
+            value DOUBLE,
+            raw_json VARCHAR
+        )"
+    );    
+    db.query(create_table_sql).await?;
 
     // Timer for periodic flush and checkpoint
     // Use prime numbers to avoid alignment with other periodic tasks
@@ -122,14 +141,17 @@ pub async fn start_mqtt_loop(counter_tot_msg: IntCounter, counter_unflushed_msg:
                         // check if we should flush to DuckDB
                         if counter_unflushed_msg.get() >= 500 {
                             // Every 500 hits, flush to DuckDB
-                            match mqtt_buffer::flush_to_duckdb(all_rows.clone(), &conn, "measurements") {
-                                Ok(_) => {
-                                    println!("Flushed {} rows to DuckDB", all_rows.len());
-                                    all_rows.clear();
+                            match mqtt_buffer::create_arrow_record_batch(&all_rows) {
+                                Ok(batch) => {
+                                    match db.insert_batch(batch, "measurements").await {
+                                        Ok(_) => {
+                                            println!("Flushed {} rows to DuckDB", all_rows.len());
+                                            all_rows.clear();
+                                        }
+                                        Err(e) => eprintln!("Error flushing to DuckDB: {}", e),
+                                    }
                                 }
-                                Err(e) => {
-                                    eprintln!("Error flushing to DuckDB: {}", e);
-                                }
+                                Err(e) => eprintln!("Error creating Arrow batch: {}", e),
                             }
                             counter_unflushed_msg.reset();
                         }
@@ -151,20 +173,45 @@ pub async fn start_mqtt_loop(counter_tot_msg: IntCounter, counter_unflushed_msg:
             _ = interval_flush.tick() => {
                 // Periodic flush and checkpoint to DuckDB
                 if !all_rows.is_empty() {
-                    match mqtt_buffer::flush_to_duckdb(all_rows.clone(), &conn, "measurements") {
-                        Ok(_) => {
-                            println!("Periodic flush: Flushed {} rows to DuckDB", all_rows.len());
-                            all_rows.clear();
-                            counter_unflushed_msg.reset();
-                        }
-                        Err(e) => {
-                            eprintln!("Error during periodic flush to DuckDB: {}", e);
-                        }
+                    match mqtt_buffer::create_arrow_record_batch(&all_rows) {
+                        Ok(batch) => match db.insert_batch(batch, "measurements").await {
+                            Ok(_) => {
+                                println!("Periodic flush: Flushed {} rows to DuckDB", all_rows.len());
+                                db.flush().await.unwrap_or_else(|e| eprintln!("Error during DuckDB checkpoint: {}", e));
+                                all_rows.clear();
+                                counter_unflushed_msg.reset();
+                            }
+                            Err(e) => eprintln!("Error during periodic flush to DuckDB: {}", e),
+                        },
+                        Err(e) => eprintln!("Error creating Arrow batch: {}", e),
                     }
+                }
+            }
+            // Shutdown signal
+            _ = shutdown.notified() => {
+                // Perform final flush before exiting
+                if !all_rows.is_empty() {
+                    match mqtt_buffer::create_arrow_record_batch(&all_rows) {
+                        Ok(batch) => match db.insert_batch(batch, "measurements").await {
+                            Ok(_) => {
+                                println!("Shutdown flush: Flushed {} rows to DuckDB", all_rows.len());
+                                all_rows.clear();
+                                db.flush().await.unwrap_or_else(|e| eprintln!("Error during DuckDB checkpoint on shutdown: {}", e));
+                                db.shutdown().await.unwrap_or_else(|e| eprintln!("Error during DuckDB shutdown: {}", e));
 
-                    conn.execute("CHECKPOINT;", []).unwrap();
-                } 
+                            }
+                            Err(e) => eprintln!("Error during shutdown flush to DuckDB: {}", e),
+                        }
+                        Err(e) => eprintln!("Error creating Arrow batch during shutdown: {}", e),
+                    }
+                }
+                println!("MQTT loop received shutdown signal, exiting.");
+                break;
             }
         }
     }
+
+    println!("MQTT loop exiting cleanly.");
+    Ok(())
 }
+

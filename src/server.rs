@@ -1,7 +1,7 @@
 // `server.rs` composes the HTTP application: it loads initial state,
 // registers Prometheus metrics, starts the MQTT background task, and
 // mounts HTTP handlers and middleware.
-use crate::{handlers, mqtt, state::{load_mappings, Store}};
+use crate::{handlers, mqtt, db, state::{load_mappings, Store}};
 use axum::{routing::{get, put}, Router, Extension};
 use prometheus::{Registry, IntCounter};
 use std::sync::Arc;
@@ -9,9 +9,9 @@ use tokio::task;
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::http::{Request, Method, HeaderValue, StatusCode};
+use tokio::signal::unix::{signal, SignalKind};
 
 // TODO
-// - Graceful shutdown handling (SIGINT/SIGTERM)
 // - IDEA: reread config/mappings on SIGHUP?
 // - Centralized database handler shared between MQTT task and HTTP handlers
 // - Persist mappings to database
@@ -26,12 +26,66 @@ pub async fn run() -> anyhow::Result<()> {
     registry.register(Box::new(mqtt_messages_received_counter.clone())).ok();
     registry.register(Box::new(mqtt_messages_not_flushed_to_db.clone())).ok();
 
+    // Start DB worker and pass handle into background tasks
+    let mqtt_messages_not_flushed_to_db_handle = mqtt_messages_not_flushed_to_db.clone();
+    let db_path = std::env::var("DUCKDB_PATH").ok();
+    let (db_handle, _db_join) = db::start_db_worker(db_path, mqtt_messages_not_flushed_to_db_handle);
+
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    let shutdown_notify_task = shutdown_notify.clone();
+
     let mqtt_messages_received_counter_task = mqtt_messages_received_counter.clone();
     let mqtt_messages_not_flushed_to_db_task = mqtt_messages_not_flushed_to_db.clone();
-    task::spawn(async move {
-        if let Err(e) = mqtt::start_mqtt_loop(mqtt_messages_received_counter_task, mqtt_messages_not_flushed_to_db_task).await {
+    let db_for_task = db_handle.clone();
+    let _mqtt_join = task::spawn(async move {
+        if let Err(e) = mqtt::start_mqtt_loop(mqtt_messages_received_counter_task, mqtt_messages_not_flushed_to_db_task, db_for_task, shutdown_notify_task).await {
             eprintln!("MQTT task ended: {}", e);
         }
+    });
+
+    let shutdown_notify_task2 = shutdown_notify.clone();
+    task::spawn(async move {
+        let mut sighup = signal(SignalKind::hangup())?;
+        let mut sigterm = signal(SignalKind::terminate())?;
+
+        // let mut sigint = signal(SignalKind::interrupt())?;
+        
+        // Handle signals for SIGHUP (checkpoint), SIGINT and SIGTERM (graceful shutdown)
+        // Ugly and should be refactored to reduce duplication
+        // As it is now, does affect 
+        loop {
+            tokio::select! {
+                _ = sighup.recv() => {
+                    println!("Received SIGHUP, CHECKPOINTING database...");
+
+                    db_handle.flush().await.unwrap_or_else(|e| {
+                        eprintln!("Error flushing DB on SIGHUP: {}", e);
+                    });
+                }
+                _ = sigterm.recv() => {
+                    println!("Received SIGTERM, shutting down...");
+                    // Notify MQTT task to shut down. It will flush and shut down the DB.
+                    shutdown_notify_task2.notify_waiters();
+
+                    println!("Waiting for MQTT task and DB thread to finish...");
+                    // Await MQTT task completion
+                    _mqtt_join.await.unwrap_or_else(|e| {
+                        eprintln!("Error awaiting MQTT task on SIGTERM: {}", e);
+                    });
+
+                    // Join DB thread
+                    _db_join.join().unwrap_or_else(|e| {
+                        eprintln!("Error joining DB thread on SIGTERM: {:?}", e);
+                    });
+
+                    println!("Shutdown complete.");
+                    break;
+                }
+            }
+        }
+
+        println!("Signal handling task exiting cleanly.");
+        Ok::<(), std::io::Error>(())
     });
 
     // Build the HTTP app. Layers are applied from bottom -> top: the
@@ -45,13 +99,24 @@ pub async fn run() -> anyhow::Result<()> {
         .fallback_service(get(handlers::spa_handler))
         .layer(Extension(store))
         .layer(Extension(registry))
+        //.layer(Extension(db_handle))
         .layer(middleware::from_fn(cors_middleware));
 
     let bind_addr = "0.0.0.0:3000";
     println!("listening on {}", bind_addr);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    axum::serve(listener, app).await?;
+    let server = axum::serve(listener, app);
+
+    let shutdown_future = {
+        let shutdown_notify_task3 = shutdown_notify.clone();
+        async move {
+            shutdown_notify_task3.notified().await;
+            println!("HTTP server shutdown signal received.");
+        }
+    };
+
+    server.with_graceful_shutdown(shutdown_future).await?;
 
     Ok(())
 }

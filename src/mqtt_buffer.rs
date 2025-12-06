@@ -80,34 +80,6 @@ pub fn normalize_one_message(json_str: &str) -> Vec<NormalizedRow> {
     rows
 }
 
-pub fn flush_to_duckdb(rows: Vec<NormalizedRow>, conn: &duckdb::Connection, table: &str) -> Result<()> {
-    let batch = create_arrow_record_batch(&rows)?;
-
-    let mut appender = conn.appender(table)?;
-    appender.append_record_batch(batch)?;
-    appender.flush()?;
-
-    Ok(())
-}
-
-pub fn create_table(conn: &duckdb::Connection, table: &str) -> Result<()> {
-    let create_table_sql = format!(
-        "CREATE TABLE IF NOT EXISTS {} (
-            timestamp TIMESTAMP,
-            model VARCHAR,
-            sensor_id VARCHAR,
-            measurement_type INTEGER,
-            value DOUBLE,
-            raw_json VARCHAR
-        )",
-        table
-    );
-
-    conn.execute(&create_table_sql, [])?;
-    Ok(())
-}
-
-
 fn parse_time(val_opt: Option<&serde_json::Value>) -> i64 {
     if let Some(v) = val_opt {
         if let Some(s) = v.as_str() {
@@ -122,7 +94,7 @@ fn parse_time(val_opt: Option<&serde_json::Value>) -> i64 {
 }
 
 
-fn create_arrow_record_batch(rows: &[NormalizedRow]) -> Result<RecordBatch> {
+pub fn create_arrow_record_batch(rows: &[NormalizedRow]) -> Result<RecordBatch> {
     let ra = TimestampMicrosecondArray::from(rows.iter().map(|r| r.timestamp).collect::<Vec<i64>>());
     let model_arr = StringArray::from(rows.iter().map(|r| r.model.clone()).collect::<Vec<String>>());
     let id_arr = StringArray::from(rows.iter().map(|r| r.sensor_id.clone()).collect::<Vec<String>>());
