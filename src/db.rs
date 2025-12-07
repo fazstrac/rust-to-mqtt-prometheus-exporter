@@ -3,8 +3,8 @@
 use duckdb::arrow::record_batch::RecordBatch;
 use crossbeam_channel::{unbounded, Sender, Receiver};
 use tokio::sync::oneshot;
-use std::thread;
-use std::thread::JoinHandle;
+use tokio::task;
+use tokio::task::JoinHandle;
 use duckdb::Connection;
 use anyhow::Result;
 use prometheus::IntCounter;
@@ -94,7 +94,8 @@ pub fn start_db_worker(path: Option<String>, mqtt_messages_not_flushed_to_db: In
     let handle = DbHandle::new(tx.clone());
 
     // Spawn a blocking thread that owns the DuckDB connection.
-    let join = thread::spawn(move || {
+    // TODO: Handle connection errors more gracefully - currently panics on failure which is not OK
+    let join = task::spawn_blocking(move || {
         let conn = match path.as_deref() {
             Some(p) => Connection::open(p).expect("open duckdb file"),
             None => Connection::open_in_memory().expect("open in-memory duckdb"),

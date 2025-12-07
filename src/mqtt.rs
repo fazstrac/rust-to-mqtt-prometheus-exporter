@@ -16,12 +16,12 @@ use crate::mqtt_buffer;
 /// `tokio::task::spawn` from `server::run()` so it runs in the background.
 use crate::db::DbHandle;
 
-pub async fn start_mqtt_loop(
+pub async fn start_mqtt_worker(
     counter_tot_msg: IntCounter, 
     counter_unflushed_msg: IntCounter,
     db: DbHandle,
     shutdown: Arc<Notify>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     // Create MQTT options from environment variables. Check for host,
     // port, username, and password; use defaults if not provided.
     // Not all fields are required; we default to localhost:1883
@@ -46,24 +46,24 @@ pub async fn start_mqtt_loop(
         }
         // Host and port provided, use both
         (Some(host), Some(port)) => {
-            match port.trim().parse::<u16>() {
-                Ok(p) => {
-                    mqttoptions = MqttOptions::new("rust_exporter_client", &host, p);
-                    println!("Connecting to MQTT broker at {}:{}", host, p);
-                }
-                Err(e) => {
-                    return Err(anyhow::anyhow!("Invalid MQTT_PORT value, expected a number, got: {}", e));
-                }
-            }
-            println!("Connecting to MQTT broker at {}:{}", host, port);
+            let p = port.trim().parse::<u16>().map_err(|e| {
+                anyhow::anyhow!("Invalid MQTT_PORT value, expected a number, got: {}", e)
+            })?;
+            mqttoptions = MqttOptions::new("rust_exporter_client", &host, p);
+            println!("Connecting to MQTT broker at {}:{:?}", host, p);            
         }
-        // Only host provided, use default port 1883
+        // Only host provided, default to port 1883
         (Some(host), None) => {
             mqttoptions = MqttOptions::new("rust_exporter_client", &host, 1883);
-            println!("Connecting to MQTT broker at {}:1883", host);
+            println!("Connecting to MQTT broker at {}:1883", host);                
         }
-        (None, Some(_)) => {
-            return Err(anyhow::anyhow!("MQTT_HOST must be set if MQTT_PORT is provided"));
+        // Only port provided, default to localhost as host
+        (None, Some(port)) => {
+            let p = port.trim().parse::<u16>().map_err(|e| {
+                anyhow::anyhow!("Invalid MQTT_PORT value, expected a number, got: {}", e)
+            })?;
+            mqttoptions = MqttOptions::new("rust_exporter_client", "localhost", p);
+            println!("Connecting to MQTT broker at localhost:{}", p);
         }
     }
 
@@ -76,7 +76,7 @@ pub async fn start_mqtt_loop(
         }
         (Some(_), None) | (None, Some(_)) => {
             // Warn but continue without credentials if only one is set.
-            eprintln!("MQTT credentials incomplete: both MQTT_USER and MQTT_PASS must be set to enable auth");
+            return Err(anyhow::anyhow!("MQTT credentials incomplete: both MQTT_USER and MQTT_PASS must be set to enable auth"));
         }
         (None, None) => {
             // No credentials configured; proceed unauthenticated.
@@ -88,11 +88,13 @@ pub async fn start_mqtt_loop(
 
     match mqtt_topic {
         Some(topic) => {
-            client.subscribe(&topic, QoS::AtLeastOnce).await?;
+            client.subscribe(&topic, QoS::AtLeastOnce).await.map_err(|e| {
+                anyhow::anyhow!("Error subscribing to MQTT topic {}: {}", topic, e)
+            })?;
             println!("Subscribing to MQTT topic: {}", topic);
         }
         None => {
-            return Err(anyhow::anyhow!("MQTT_TOPIC environment variable must be set to subscribe to topics"));
+            return Err(anyhow::anyhow!("MQTT_TOPIC environment variable not set, cannot subscribe to topic"));
         }
     }
 
@@ -108,110 +110,114 @@ pub async fn start_mqtt_loop(
             value DOUBLE,
             raw_json VARCHAR
         )"
-    );    
-    db.query(create_table_sql).await?;
+    );
 
+    db.query(create_table_sql).await.map_err(|e| {
+            anyhow::anyhow!("Error creating measurements table in DuckDB: {}", e)
+    })?;
+    
     // Timer for periodic flush and checkpoint
     // Use prime numbers to avoid alignment with other periodic tasks
-    let mut interval_flush = time::interval(Duration::from_secs(113));
+    let mut interval_flush = time::interval(Duration::from_secs(293));
 
-    loop {
-        tokio::select! {
-            // General idea:
-            // Handle incoming MQTT messages and process them
-            // Flush to DuckDB periodically or based on message count if there is a burst
-            // Checkpoint DuckDB periodically to ensure data is persisted
+    let join_handle = tokio::task::spawn(async move {        
+        loop {
+            tokio::select! {
+                // General idea:
+                // Handle incoming MQTT messages and process them
+                // Flush to DuckDB periodically or based on message count if there is a burst
+                // Checkpoint DuckDB periodically to ensure data is persisted
 
-            // MQTT event
-            ev = eventloop.poll() => {
-                match ev {
-                    // increase unflushed count and store normalized rows
-                    // on receiving a publish
-                    // If unflushed count exceeds threshold, flush to DuckDB
-                    // that happens most likely during bursts of messages (over 500 msgs per 113 seconds)
-                    Ok(Event::Incoming(Incoming::Publish(p))) => {                
-                        counter_tot_msg.inc();
-                        counter_unflushed_msg.inc();
-                        println!("Got topic: {}, Count: {}, Unflushed: {}", p.topic, counter_tot_msg.get(), counter_unflushed_msg.get());
+                // MQTT event
+                ev = eventloop.poll() => {
+                    match ev {
+                        // increase unflushed count and store normalized rows
+                        // on receiving a publish
+                        // If unflushed count exceeds threshold, flush to DuckDB
+                        // that happens most likely during bursts of messages (over 500 msgs per 113 seconds)
+                        Ok(Event::Incoming(Incoming::Publish(p))) => {                
+                            counter_tot_msg.inc();
+                            counter_unflushed_msg.inc();
+                            println!("Got topic: {}, Count: {}, Unflushed: {}", p.topic, counter_tot_msg.get(), counter_unflushed_msg.get());
 
-                        let payload_str = String::from_utf8_lossy(&p.payload);
-                        let rows = mqtt_buffer::normalize_one_message(&payload_str);
-                        all_rows.extend(rows);
+                            let payload_str = String::from_utf8_lossy(&p.payload);
+                            let rows = mqtt_buffer::normalize_one_message(&payload_str);
+                            all_rows.extend(rows);
 
-                        // check if we should flush to DuckDB
-                        if counter_unflushed_msg.get() >= 500 {
-                            // Every 500 hits, flush to DuckDB
-                            match mqtt_buffer::create_arrow_record_batch(&all_rows) {
-                                Ok(batch) => {
-                                    match db.insert_batch(batch, "measurements").await {
-                                        Ok(_) => {
-                                            println!("Flushed {} rows to DuckDB", all_rows.len());
-                                            all_rows.clear();
+                            // check if we should flush to DuckDB
+                            if counter_unflushed_msg.get() >= 500 {
+                                // Every 500 hits, flush to DuckDB
+                                match mqtt_buffer::create_arrow_record_batch(&all_rows) {
+                                    Ok(batch) => {
+                                        match db.insert_batch(batch, "measurements").await {
+                                            Ok(_) => {
+                                                println!("Flushed {} rows to DuckDB", all_rows.len());
+                                                all_rows.clear();
+                                            }
+                                            Err(e) => eprintln!("Error flushing to DuckDB: {}", e),
                                         }
-                                        Err(e) => eprintln!("Error flushing to DuckDB: {}", e),
                                     }
+                                    Err(e) => eprintln!("Error creating Arrow batch: {}", e),
                                 }
-                                Err(e) => eprintln!("Error creating Arrow batch: {}", e),
-                            }
-                            counter_unflushed_msg.reset();
-                        }
-                    }
-                    Ok(Event::Incoming(i)) => {
-                        println!("Incoming = {i:?}");
-                    }
-                    Ok(Event::Outgoing(o)) => {
-                        println!("Outgoing = {o:?}");
-                    }
-                    Err(e) => {
-                        // Back off on errors to avoid busy loops.
-                        eprintln!("mqtt loop error: {}", e);
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                }
-            }
-            // Timer tick
-            _ = interval_flush.tick() => {
-                // Periodic flush and checkpoint to DuckDB
-                if !all_rows.is_empty() {
-                    match mqtt_buffer::create_arrow_record_batch(&all_rows) {
-                        Ok(batch) => match db.insert_batch(batch, "measurements").await {
-                            Ok(_) => {
-                                println!("Periodic flush: Flushed {} rows to DuckDB", all_rows.len());
-                                db.flush().await.unwrap_or_else(|e| eprintln!("Error during DuckDB checkpoint: {}", e));
-                                all_rows.clear();
                                 counter_unflushed_msg.reset();
                             }
-                            Err(e) => eprintln!("Error during periodic flush to DuckDB: {}", e),
-                        },
-                        Err(e) => eprintln!("Error creating Arrow batch: {}", e),
-                    }
-                }
-            }
-            // Shutdown signal
-            _ = shutdown.notified() => {
-                // Perform final flush before exiting
-                if !all_rows.is_empty() {
-                    match mqtt_buffer::create_arrow_record_batch(&all_rows) {
-                        Ok(batch) => match db.insert_batch(batch, "measurements").await {
-                            Ok(_) => {
-                                println!("Shutdown flush: Flushed {} rows to DuckDB", all_rows.len());
-                                all_rows.clear();
-                                db.flush().await.unwrap_or_else(|e| eprintln!("Error during DuckDB checkpoint on shutdown: {}", e));
-                                db.shutdown().await.unwrap_or_else(|e| eprintln!("Error during DuckDB shutdown: {}", e));
-
-                            }
-                            Err(e) => eprintln!("Error during shutdown flush to DuckDB: {}", e),
                         }
-                        Err(e) => eprintln!("Error creating Arrow batch during shutdown: {}", e),
+                        Ok(Event::Incoming(i)) => {
+                            println!("Incoming = {i:?}");
+                        }
+                        Ok(Event::Outgoing(o)) => {
+                            println!("Outgoing = {o:?}");
+                        }
+                        Err(e) => {
+                            // Back off on errors to avoid busy loops.
+                            eprintln!("mqtt loop error: {}", e);
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        }
                     }
                 }
-                println!("MQTT loop received shutdown signal, exiting.");
-                break;
+                // Timer tick
+                _ = interval_flush.tick() => {
+                    // Periodic flush and checkpoint to DuckDB
+                    if !all_rows.is_empty() {
+                        match mqtt_buffer::create_arrow_record_batch(&all_rows) {
+                            Ok(batch) => match db.insert_batch(batch, "measurements").await {
+                                Ok(_) => {
+                                    println!("Periodic flush: Flushed {} rows to DuckDB", all_rows.len());
+                                    db.flush().await.unwrap_or_else(|e| eprintln!("Error during DuckDB checkpoint: {}", e));
+                                    all_rows.clear();
+                                    counter_unflushed_msg.reset();
+                                }
+                                Err(e) => eprintln!("Error during periodic flush to DuckDB: {}", e),
+                            },
+                            Err(e) => eprintln!("Error creating Arrow batch: {}", e),
+                        }
+                    }
+                }
+                // Shutdown signal
+                _ = shutdown.notified() => {
+                    // Perform final flush before exiting
+                    if !all_rows.is_empty() {
+                        match mqtt_buffer::create_arrow_record_batch(&all_rows) {
+                            Ok(batch) => match db.insert_batch(batch, "measurements").await {
+                                Ok(_) => {
+                                    println!("Shutdown flush: Flushed {} rows to DuckDB", all_rows.len());
+                                    all_rows.clear();
+                                    db.flush().await.unwrap_or_else(|e| eprintln!("Error during DuckDB checkpoint on shutdown: {}", e));
+                                }
+                                Err(e) => eprintln!("Error during shutdown flush to DuckDB: {}", e),
+                            }
+                            Err(e) => eprintln!("Error creating Arrow batch during shutdown: {}", e),
+                        }
+                    }
+                    println!("MQTT loop received shutdown signal, exiting.");
+                    break;
+                }
             }
         }
-    }
 
     println!("MQTT loop exiting cleanly.");
-    Ok(())
+    });
+
+    Ok(join_handle)
 }
 

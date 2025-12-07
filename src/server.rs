@@ -26,6 +26,8 @@ pub async fn run() -> anyhow::Result<()> {
     registry.register(Box::new(mqtt_messages_received_counter.clone())).ok();
     registry.register(Box::new(mqtt_messages_not_flushed_to_db.clone())).ok();
 
+
+
     // Start DB worker and pass handle into background tasks
     let mqtt_messages_not_flushed_to_db_handle = mqtt_messages_not_flushed_to_db.clone();
     let db_path = std::env::var("DUCKDB_PATH").ok();
@@ -34,22 +36,53 @@ pub async fn run() -> anyhow::Result<()> {
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let shutdown_notify_task = shutdown_notify.clone();
 
+
+
+    // Start MQTT background task
     let mqtt_messages_received_counter_task = mqtt_messages_received_counter.clone();
     let mqtt_messages_not_flushed_to_db_task = mqtt_messages_not_flushed_to_db.clone();
     let db_for_task = db_handle.clone();
-    let _mqtt_join = task::spawn(async move {
-        if let Err(e) = mqtt::start_mqtt_loop(mqtt_messages_received_counter_task, mqtt_messages_not_flushed_to_db_task, db_for_task, shutdown_notify_task).await {
-            eprintln!("MQTT task ended: {}", e);
-        }
-    });
+    let mqtt_join = mqtt::start_mqtt_worker(
+        mqtt_messages_received_counter_task, 
+        mqtt_messages_not_flushed_to_db_task, 
+        db_for_task, 
+        shutdown_notify_task
+    ).await.unwrap();
 
+    // Spawn a task to handle Unix signals for graceful shutdown
     let shutdown_notify_task2 = shutdown_notify.clone();
-    task::spawn(async move {
-        let mut sighup = signal(SignalKind::hangup())?;
-        let mut sigterm = signal(SignalKind::terminate())?;
+    let signal_task = task::spawn(async move {
+        let mut sighup = signal(SignalKind::hangup()).unwrap();
+        let mut sigterm = signal(SignalKind::terminate()).unwrap();
+        let mut sigint = signal(SignalKind::interrupt()).unwrap();
 
-        // let mut sigint = signal(SignalKind::interrupt())?;
-        
+        let handle_shutdown = async |signal_name: String| {
+            println!("Received {}, shutting down...", signal_name);
+            // Notify MQTT task to shut down. It will flush and shut down the DB.
+            shutdown_notify_task2.notify_waiters();
+
+            println!("Waiting for MQTT task and DB thread to finish...");
+
+            // REFACTOR: refactor http handlers and mqtt task to share db handle properly
+            // also refactor http handler into its own module and create start_http_server function
+
+            // Await MQTT task completion
+            mqtt_join.await.unwrap_or_else(|e| {
+                eprintln!("Error joining MQTT task on shutdown: {}", e);
+            });
+
+            db_handle.shutdown().await.unwrap_or_else(|e| {
+                eprintln!("Error shutting down DB on shutdown: {}", e);
+            });
+
+            // Join DB thread
+            _db_join.await.unwrap_or_else(|e| {
+                eprintln!("Error joining DB thread on shutdown: {:?}", e);
+            });
+
+            println!("Shutdown complete.");            
+        };
+
         // Handle signals for SIGHUP (checkpoint), SIGINT and SIGTERM (graceful shutdown)
         // Ugly and should be refactored to reduce duplication
         // As it is now, does affect 
@@ -62,30 +95,18 @@ pub async fn run() -> anyhow::Result<()> {
                         eprintln!("Error flushing DB on SIGHUP: {}", e);
                     });
                 }
+                _ = sigint.recv() => {
+                    handle_shutdown("SIGINT".to_string()).await;
+                    break;
+                },
                 _ = sigterm.recv() => {
-                    println!("Received SIGTERM, shutting down...");
-                    // Notify MQTT task to shut down. It will flush and shut down the DB.
-                    shutdown_notify_task2.notify_waiters();
-
-                    println!("Waiting for MQTT task and DB thread to finish...");
-                    // Await MQTT task completion
-                    _mqtt_join.await.unwrap_or_else(|e| {
-                        eprintln!("Error awaiting MQTT task on SIGTERM: {}", e);
-                    });
-
-                    // Join DB thread
-                    _db_join.join().unwrap_or_else(|e| {
-                        eprintln!("Error joining DB thread on SIGTERM: {:?}", e);
-                    });
-
-                    println!("Shutdown complete.");
+                    handle_shutdown("SIGTERM".to_string()).await;
                     break;
                 }
             }
         }
 
         println!("Signal handling task exiting cleanly.");
-        Ok::<(), std::io::Error>(())
     });
 
     // Build the HTTP app. Layers are applied from bottom -> top: the
@@ -117,6 +138,7 @@ pub async fn run() -> anyhow::Result<()> {
     };
 
     server.with_graceful_shutdown(shutdown_future).await?;
+    signal_task.await.unwrap();
 
     Ok(())
 }
